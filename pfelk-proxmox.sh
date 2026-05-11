@@ -237,6 +237,14 @@ ES_EOF
 sed -i "s/-Xms[0-9]*[mg]/-Xms${HEAP_MB}m/g" /etc/elasticsearch/jvm.options
 sed -i "s/-Xmx[0-9]*[mg]/-Xmx${HEAP_MB}m/g" /etc/elasticsearch/jvm.options
 
+# Pre-load the elastic bootstrap password into the keystore so ES sets it on
+# first start — avoids needing elasticsearch-reset-password after boot.
+/usr/share/elasticsearch/bin/elasticsearch-keystore create -s 2>/dev/null || true
+printf '%s' "${ELASTIC_PASSWORD}" | \
+  /usr/share/elasticsearch/bin/elasticsearch-keystore add -xf bootstrap.password 2>/dev/null || \
+  printf '%s\n' "${ELASTIC_PASSWORD}" | \
+  /usr/share/elasticsearch/bin/elasticsearch-keystore add -x bootstrap.password 2>/dev/null || true
+
 msg_ok "Elasticsearch configured (heap: ${HEAP_MB} MB)"
 
 # ── Configure Logstash ────────────────────────────────────────────────────────
@@ -287,12 +295,10 @@ server.name: "pfelk"
 elasticsearch.hosts: ["https://localhost:9200"]
 elasticsearch.username: "kibana_system"
 elasticsearch.password: "${KIBANA_PASSWORD}"
-elasticsearch.ssl.certificateAuthorities: ["/etc/pfelk/config/certs/http_ca.crt"]
+elasticsearch.ssl.certificateAuthorities: ["/etc/kibana/http_ca.crt"]
 xpack.security.encryptionKey: "${KB_ENC_KEY}"
 xpack.encryptedSavedObjects.encryptionKey: "${KB_ENC_KEY}"
 xpack.reporting.encryptionKey: "${KB_ENC_KEY}"
-logging.appenders.default.type: console
-logging.root.level: warn
 KB_EOF
 
 msg_ok "Kibana configured"
@@ -619,9 +625,13 @@ PIPE_EOF
 
 msg_ok "Pipeline files written"
 
-# Set ownership so Logstash can read
+# Pipeline files and patterns: logstash-only
 chown -R root:logstash /etc/pfelk/ 2>/dev/null || true
-chmod -R 750 /etc/pfelk/ 2>/dev/null || true
+chmod 750 /etc/pfelk /etc/pfelk/conf.d /etc/pfelk/patterns \
+          /etc/pfelk/databases 2>/dev/null || true
+chmod 640 /etc/pfelk/conf.d/*.pfelk /etc/pfelk/patterns/*.grok 2>/dev/null || true
+# Cert dir is populated later; set it world-traversable so kibana can also read its copy
+chmod 755 /etc/pfelk/config /etc/pfelk/config/certs 2>/dev/null || true
 
 # ── Start Elasticsearch ───────────────────────────────────────────────────────
 msg_info "Starting Elasticsearch"
@@ -645,40 +655,47 @@ done
 msg_ok "Elasticsearch started"
 
 # ── Copy CA cert ──────────────────────────────────────────────────────────────
-cp /etc/elasticsearch/certs/http_ca.crt /etc/pfelk/config/certs/
+ES_CA_SRC="/etc/elasticsearch/certs/http_ca.crt"
+
+# For Logstash (read via logstash group)
+cp "$ES_CA_SRC" /etc/pfelk/config/certs/http_ca.crt
 chown root:logstash /etc/pfelk/config/certs/http_ca.crt 2>/dev/null || true
 chmod 640 /etc/pfelk/config/certs/http_ca.crt
 
+# For Kibana (kibana user owns /etc/kibana and can't traverse /etc/pfelk)
+cp "$ES_CA_SRC" /etc/kibana/http_ca.crt
+chown root:kibana /etc/kibana/http_ca.crt 2>/dev/null || \
+  chown root:root  /etc/kibana/http_ca.crt 2>/dev/null || true
+chmod 640 /etc/kibana/http_ca.crt
+
 # ── Set Elasticsearch passwords ───────────────────────────────────────────────
+# The elastic password was pre-loaded as bootstrap.password before ES started,
+# so we can use it directly — no need for elasticsearch-reset-password.
 msg_info "Setting Elasticsearch passwords"
 
-ES_CACERT="--cacert /etc/elasticsearch/certs/http_ca.crt"
 ES_URL="https://localhost:9200"
+ES_CA="/etc/elasticsearch/certs/http_ca.crt"
 
-# Reset elastic to get a known bootstrap password, then set our desired one
-RESET_OUT=$(/usr/share/elasticsearch/bin/elasticsearch-reset-password \
-  -u elastic --batch 2>&1 || true)
-BOOT_PASS=$(echo "$RESET_OUT" | awk '/New value:/{print $NF}')
-
-if [[ -z "$BOOT_PASS" ]]; then
-  # Fallback: try parsing different output format
-  BOOT_PASS=$(echo "$RESET_OUT" | grep -oP '(?<=New value: )\S+' || true)
-fi
-
-# Set elastic to our generated password
-curl -sk $ES_CACERT -X PUT "${ES_URL}/_security/user/elastic/_password" \
-  -u "elastic:${BOOT_PASS}" \
-  -H "Content-Type: application/json" \
-  -d "{\"password\":\"${ELASTIC_PASSWORD}\"}" >/dev/null
+# Confirm the bootstrap password is accepted (retry in case cluster health
+# isn't fully settled yet — 401 on the root endpoint isn't enough)
+for attempt in $(seq 1 10); do
+  HTTP_CODE=$(curl -sk --cacert "$ES_CA" -o /dev/null -w "%{http_code}" \
+    -u "elastic:${ELASTIC_PASSWORD}" \
+    "${ES_URL}/_cluster/health" 2>/dev/null || echo "000")
+  [[ "$HTTP_CODE" == "200" ]] && break
+  sleep 5
+done
 
 # kibana_system password
-curl -sk $ES_CACERT -X PUT "${ES_URL}/_security/user/kibana_system/_password" \
+curl -sk --cacert "$ES_CA" \
+  -X PUT "${ES_URL}/_security/user/kibana_system/_password" \
   -u "elastic:${ELASTIC_PASSWORD}" \
   -H "Content-Type: application/json" \
-  -d "{\"password\":\"${KIBANA_PASSWORD}\"}" >/dev/null &
+  -d "{\"password\":\"${KIBANA_PASSWORD}\"}" >/dev/null 2>&1 || true
 
 # logstash_writer role
-curl -sk $ES_CACERT -X PUT "${ES_URL}/_security/role/logstash_writer" \
+curl -sk --cacert "$ES_CA" \
+  -X PUT "${ES_URL}/_security/role/logstash_writer" \
   -u "elastic:${ELASTIC_PASSWORD}" \
   -H "Content-Type: application/json" \
   -d '{
@@ -688,47 +705,49 @@ curl -sk $ES_CACERT -X PUT "${ES_URL}/_security/role/logstash_writer" \
       "names":      ["logs-pfelk.*","metrics-pfelk.*","traces-pfelk.*"],
       "privileges": ["write","create","create_index","manage","auto_configure"]
     }]
-  }' >/dev/null &
+  }' >/dev/null 2>&1 || true
 
-wait
-
-# logstash_writer user (depends on role creation above completing)
-curl -sk $ES_CACERT -X PUT "${ES_URL}/_security/user/logstash_writer" \
+# logstash_writer user (sequential — role must exist first)
+curl -sk --cacert "$ES_CA" \
+  -X PUT "${ES_URL}/_security/user/logstash_writer" \
   -u "elastic:${ELASTIC_PASSWORD}" \
   -H "Content-Type: application/json" \
   -d "{
     \"password\": \"${LOGSTASH_PASSWORD}\",
     \"roles\":    [\"logstash_writer\"],
     \"full_name\": \"pfelk Logstash Writer\"
-  }" >/dev/null
+  }" >/dev/null 2>&1 || true
 
 msg_ok "Elasticsearch passwords set"
 
 # ── Start Logstash and Kibana ─────────────────────────────────────────────────
 msg_info "Starting Logstash and Kibana"
-systemctl enable -q logstash kibana
-systemctl start logstash &
-systemctl start kibana &
-wait
+systemctl enable -q logstash kibana 2>/dev/null || true
+systemctl start logstash 2>/dev/null || true
+systemctl start kibana  2>/dev/null || true
 msg_ok "Logstash and Kibana starting"
 
 # ── Wait for Kibana ───────────────────────────────────────────────────────────
-msg_info "Waiting for Kibana (up to 5 min)"
-for i in $(seq 1 60); do
-  KB_LEVEL=$(curl -sk "http://localhost:5601/api/status" \
+msg_info "Waiting for Kibana (up to 10 min)"
+KB_READY=0
+for i in $(seq 1 120); do
+  KB_RESP=$(curl -sk --connect-timeout 3 --max-time 8 \
+    "http://localhost:5601/api/status" \
     -u "elastic:${ELASTIC_PASSWORD}" \
-    -H "kbn-xsrf: true" 2>/dev/null \
-    | python3 -c "
-import sys,json
-try:
-    d=json.load(sys.stdin)
-    print(d.get('status',{}).get('overall',{}).get('level',''))
-except: print('')
-" 2>/dev/null || true)
-  [[ "$KB_LEVEL" == "available" ]] && break
+    -H "kbn-xsrf: true" 2>/dev/null || true)
+  # Accept "available" or "degraded" — both allow dashboard import
+  if echo "$KB_RESP" | grep -qE '"level":"(available|degraded)"'; then
+    KB_READY=1
+    break
+  fi
   sleep 5
 done
-msg_ok "Kibana ready"
+if [[ $KB_READY -eq 1 ]]; then
+  msg_ok "Kibana ready"
+else
+  printf "${BFR}"
+  printf " ${YW}⚠${CL} Kibana did not report ready — attempting dashboard import anyway\n"
+fi
 
 # ── Import pfelk dashboards ───────────────────────────────────────────────────
 msg_info "Importing pfelk dashboards"
@@ -738,22 +757,11 @@ KB_URL="http://localhost:5601"
 GH_API="https://api.github.com/repos/pfelk/pfelk/contents/etc/pfelk/dashboard"
 GH_RAW="https://raw.githubusercontent.com/pfelk/pfelk/main/etc/pfelk/dashboard"
 
-# Fetch dashboard file list from GitHub API (latest files per topic)
-NDJSON_FILES=$(curl -fsSL "$GH_API" 2>/dev/null \
-  | python3 -c "
-import sys, json, re
-try:
-    files = json.load(sys.stdin)
-    names = [f['name'] for f in files if f['name'].endswith('.ndjson')]
-    # deduplicate by topic: keep the lexicographically last (newest) per base name
-    seen = {}
-    for n in sorted(names):
-        key = re.sub(r'[-_][0-9]+\\.ndjson$', '', n)
-        seen[key] = n
-    print('\\n'.join(seen.values()))
-except Exception as e:
-    pass
-" 2>/dev/null || true)
+# Fetch dashboard file list from GitHub API (grep for .ndjson names)
+NDJSON_FILES=$(curl -fsSL --connect-timeout 10 --max-time 20 "$GH_API" 2>/dev/null \
+  | grep -o '"name":"[^"]*\.ndjson"' \
+  | cut -d'"' -f4 \
+  | sort -u || true)
 
 # Fallback static list if GitHub API unavailable
 if [[ -z "$NDJSON_FILES" ]]; then
@@ -809,11 +817,34 @@ cat > /root/pfelk.creds << CREDS_EOF
 CREDS_EOF
 chmod 600 /root/pfelk.creds
 
+# ── Ensure all services are enabled and running ───────────────────────────────
+msg_info "Enabling services on boot"
+systemctl enable -q elasticsearch logstash kibana 2>/dev/null || true
+msg_ok "Services enabled"
+
+msg_info "Starting Elasticsearch"
+systemctl start elasticsearch 2>/dev/null || true
+msg_ok "Elasticsearch started"
+
+# ── Service status ────────────────────────────────────────────────────────────
 echo ""
 echo "══════════════════════════════════════════════════════"
 echo "  pfelk installation complete!"
 echo "══════════════════════════════════════════════════════"
 cat /root/pfelk.creds
+echo ""
+echo "── Service Status ────────────────────────────────────"
+for svc in elasticsearch logstash kibana; do
+  state=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
+  if [[ "$state" == "active" ]]; then
+    printf "  ✓ %-16s %s\n" "$svc" "$state"
+  else
+    printf "  ✗ %-16s %s\n" "$svc" "$state"
+  fi
+done
+echo "══════════════════════════════════════════════════════"
+echo "  Note: Kibana can take several minutes to fully start."
+echo "  If the web UI is not ready, wait 3-5 min and retry."
 echo "══════════════════════════════════════════════════════"
 
 CONTAINER_SCRIPT
@@ -833,16 +864,29 @@ echo ""
 
 pct exec "$CTID" -- bash /root/pfelk-install.sh
 
-# ── Host-side completion banner ───────────────────────────────────────────────
+# ── Fetch ELK credentials written by the install script ──────────────────────
+PFELK_CREDS=$(pct exec "$CTID" -- cat /root/pfelk.creds 2>/dev/null \
+  || echo "  (credentials file not found — check container logs)")
+
+# Resolve final IP in case DHCP assigned it after install
+CT_IP=$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}' || echo "${CT_IP:-unknown}")
+
+# ── Final summary — all passwords ────────────────────────────────────────────
 echo ""
 echo -e "${GN}╔══════════════════════════════════════════════════════╗${CL}"
-echo -e "${GN}║        pfelk LXC Container Ready!                   ║${CL}"
+echo -e "${GN}║          pfelk LXC Container Ready!                 ║${CL}"
 echo -e "${GN}╚══════════════════════════════════════════════════════╝${CL}"
 echo ""
-echo -e "  Container ID    : ${BL}${CTID}${CL}"
-echo -e "  Root password   : ${BL}${ROOT_PASS}${CL}"
-echo -e "  Container IP    : ${BL}${CT_IP:-run: pct exec ${CTID} -- hostname -I}${CL}"
+echo -e "  Container ID      : ${BL}${CTID}${CL}"
+echo -e "  Container IP      : ${BL}${CT_IP}${CL}"
 echo ""
-echo -e "  Credentials file: ${BL}/root/pfelk.creds${CL}"
-echo -e "  View with       : ${BL}pct exec ${CTID} -- cat /root/pfelk.creds${CL}"
+echo -e "${GN}── LXC Access ──────────────────────────────────────────${CL}"
+echo -e "  Root username     : ${BL}root${CL}"
+echo -e "  Root password     : ${BL}${ROOT_PASS}${CL}"
+echo -e "  Shell             : ${BL}pct enter ${CTID}${CL}"
+echo ""
+echo -e "${GN}── ELK / pfelk Credentials ─────────────────────────────${CL}"
+echo "$PFELK_CREDS"
+echo ""
+echo -e "  Saved in container: ${BL}/root/pfelk.creds${CL}"
 echo ""
